@@ -280,7 +280,7 @@ async def play_next(ctx):
             description="All songs have been played!",
             color=0x1DB954
         )
-        embed.set_footer(text="Use !play to add more songs")
+        embed.set_footer(text="Use !p or /p to add more songs")
         await ctx.send(embed=embed)
         return
     
