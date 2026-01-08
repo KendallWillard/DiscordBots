@@ -376,52 +376,53 @@ async def test_audio(ctx):
         await ctx.send(f"❌ Error: {str(e)}")
         print(f"Test audio error: {e}")
 
-# FIXED: Proper autocomplete that returns immediately
 async def song_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-    """Autocomplete for song searches using YouTube suggestions"""
     print(f"AUTOCOMPLETE TRIGGERED: current='{current}'")
     
-    # Return empty if query too short
-    if len(current) < 2:
+    if len(current) < 3:
         print("AUTOCOMPLETE: Query too short")
         return []
     
-    try:
-        # Use a very short timeout and catch all errors
-        async with aiohttp.ClientSession() as session:
-            url = "https://suggestqueries.google.com/complete/search"
-            params = {
-                'client': 'firefox',  # firefox is more reliable than youtube
-                'q': current
-            }
-            
-            print(f"AUTOCOMPLETE: Requesting suggestions for '{current}'")
-            
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=2)) as resp:
+    async with aiohttp.ClientSession() as session:
+        try:
+            # YouTube suggestions (your current fast ones)
+            yt_url = "https://suggestqueries.google.com/complete/search"
+            yt_params = {'client': 'youtube', 'ds': 'yt', 'q': current}
+            async with session.get(yt_url, params=yt_params, timeout=2.0) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    start = text.find('(')
+                    if start != -1:
+                        json_text = text[start+1:-1]
+                        import json
+                        data = json.loads(json_text)
+                        if len(data) > 1:
+                            suggestions = [item[0] for item in data[1][:5] if isinstance(item, list) and len(item) > 0]
+                            choices = [app_commands.Choice(name=sugg[:100], value=sugg) for sugg in suggestions]
+                            print(f"AUTOCOMPLETE: Returning {len(choices)} YouTube suggestions")
+                            return choices
+        except Exception as e:
+            print(f"AUTOCOMPLETE YouTube error: {repr(e)}")
+        
+        # Fallback: General Google suggestions (often Spotify-like for music)
+        try:
+            google_url = "https://suggestqueries.google.com/complete/search"
+            google_params = {'client': 'firefox', 'q': f"{current} spotify"}
+            async with session.get(google_url, params=google_params, timeout=2.0) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    print(f"AUTOCOMPLETE: Got response: {data}")
-                    
-                    # Firefox endpoint returns [query, [suggestions]]
-                    if len(data) > 1 and isinstance(data[1], list):
-                        suggestions = data[1][:10]  # Get up to 10 suggestions
-                        choices = [
-                            app_commands.Choice(name=sugg[:100], value=sugg[:100])
-                            for sugg in suggestions
-                            if isinstance(sugg, str) and len(sugg) > 0
-                        ]
-                        print(f"AUTOCOMPLETE: Returning {len(choices)} choices")
-                        return choices[:25]  # Discord limit is 25
-                    
-    except asyncio.TimeoutError:
-        print("AUTOCOMPLETE: Timeout occurred")
-    except Exception as e:
-        print(f"AUTOCOMPLETE: Error - {type(e).__name__}: {e}")
+                    if len(data) > 1:
+                        suggestions = [sugg for sugg in data[1][:5] if isinstance(sugg, str)]
+                        # Clean "song name spotify" → "song name"
+                        clean_suggestions = [sugg.replace(" spotify", "", 1).replace(" Spotify", "", 1) for sugg in suggestions]
+                        choices = [app_commands.Choice(name=sugg[:100], value=sugg) for sugg in clean_suggestions]
+                        print(f"AUTOCOMPLETE: Returning {len(choices)} Spotify-like suggestions")
+                        return choices
+        except Exception as e:
+            print(f"AUTOCOMPLETE Google fallback error: {repr(e)}")
     
-    # Fallback: return the user's current input as a choice
-    print("AUTOCOMPLETE: Returning user input as fallback")
-    return [app_commands.Choice(name=f"Search: {current}", value=current)]
-
+    print("AUTOCOMPLETE: No suggestions, returning empty")
+    return []
 
 @bot.hybrid_command(name="p", description="Play a song from YouTube/Spotify", aliases=["play"])
 @app_commands.describe(query="Song name, YouTube/Spotify URL, or search query")
@@ -462,12 +463,14 @@ async def play(ctx: commands.Context, *, query: str):
                     return
                 
                 if not tracks:
-                    await ctx.send("❌ No tracks found or URL is private/restricted.")
-                    client.close()
-                    return
-                
+                        await ctx.send("❌ No tracks found or URL is private/restricted.")
+                        client.close()
+                        return
+
                 added = 0
                 skipped = 0
+                started_playback = False
+
                 for track in tracks:
                     artist = track.get('artists', [{}])[0].get('name', '') if track.get('artists') else ''
                     title = track.get('name', '')
@@ -479,30 +482,30 @@ async def play(ctx: commands.Context, *, query: str):
                     yt_data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(search_query, download=False))
                     
                     if 'entries' in yt_data and yt_data['entries']:
-                        # Pick the best: Longest duration >60s (avoid clips)
                         valid_entries = [e for e in yt_data['entries'] if e and e.get('duration', 0) > 60]
                         if valid_entries:
                             yt_entry = sorted(valid_entries, key=lambda x: x.get('duration', 0), reverse=True)[0]
-                            queue.add({
+                            song_info = {
                                 'url': yt_entry.get('webpage_url'),
                                 'title': yt_entry.get('title'),
                                 'duration': yt_entry.get('duration'),
                                 'thumbnail': yt_entry.get('thumbnail')
-                            })
+                            }
+                            queue.add(song_info)
                             added += 1
+
+                            # Start playback on the very first successful add
+                            if not started_playback and not ctx.voice_client.is_playing():
+                                await play_next(ctx)
+                                started_playback = True
                         else:
                             skipped += 1
                     else:
                         skipped += 1
-                
+
                 client.close()
                 
-                if added > 0:
-                    await ctx.send(f"✅ Added {added} tracks from Spotify {spotify_type}! (Skipped {skipped} due to no matches)")
-                    if not ctx.voice_client.is_playing():
-                        await play_next(ctx)
-                else:
-                    await ctx.send("❌ No valid YouTube matches found for any tracks.")
+                await ctx.send(f"✅ Added {added} tracks from Spotify {spotify_type}! (Skipped {skipped} due to no matches)")
             else:
                 # Search YouTube
                 search_query = f"ytsearch:{query}"
