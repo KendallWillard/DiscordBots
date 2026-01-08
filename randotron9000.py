@@ -11,6 +11,7 @@ import traceback  # <--- ADDED: For full traceback logging
 from spotify_scraper import SpotifyClient  # <--- ADDED: For Spotify scraping (no API creds needed)
 from discord import app_commands  # Add this import if not already there
 import aiohttp  # Add this import at the top if missing
+from dotenv import load_dotenv  # <--- ADD this import
 
 # Load opus explicitly
 if not discord.opus.is_loaded():
@@ -21,8 +22,11 @@ if not discord.opus.is_loaded():
         print(f"Failed to load libopus: {repr(e)}")
 
 # Configuration
+load_dotenv()  # <--- ADD this line (loads .env file)
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN');
 
+if DISCORD_TOKEN is None:
+    raise ValueError("DISCORD_TOKEN not found in .env file!")
 # Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
@@ -372,8 +376,56 @@ async def test_audio(ctx):
         await ctx.send(f"❌ Error: {str(e)}")
         print(f"Test audio error: {e}")
 
-@bot.hybrid_command(name="peepee", description="Play a song from YouTube/Spotify (searches YouTube if not a URL)")
+# FIXED: Proper autocomplete that returns immediately
+async def song_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    """Autocomplete for song searches using YouTube suggestions"""
+    print(f"AUTOCOMPLETE TRIGGERED: current='{current}'")
+    
+    # Return empty if query too short
+    if len(current) < 2:
+        print("AUTOCOMPLETE: Query too short")
+        return []
+    
+    try:
+        # Use a very short timeout and catch all errors
+        async with aiohttp.ClientSession() as session:
+            url = "https://suggestqueries.google.com/complete/search"
+            params = {
+                'client': 'firefox',  # firefox is more reliable than youtube
+                'q': current
+            }
+            
+            print(f"AUTOCOMPLETE: Requesting suggestions for '{current}'")
+            
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    print(f"AUTOCOMPLETE: Got response: {data}")
+                    
+                    # Firefox endpoint returns [query, [suggestions]]
+                    if len(data) > 1 and isinstance(data[1], list):
+                        suggestions = data[1][:10]  # Get up to 10 suggestions
+                        choices = [
+                            app_commands.Choice(name=sugg[:100], value=sugg[:100])
+                            for sugg in suggestions
+                            if isinstance(sugg, str) and len(sugg) > 0
+                        ]
+                        print(f"AUTOCOMPLETE: Returning {len(choices)} choices")
+                        return choices[:25]  # Discord limit is 25
+                    
+    except asyncio.TimeoutError:
+        print("AUTOCOMPLETE: Timeout occurred")
+    except Exception as e:
+        print(f"AUTOCOMPLETE: Error - {type(e).__name__}: {e}")
+    
+    # Fallback: return the user's current input as a choice
+    print("AUTOCOMPLETE: Returning user input as fallback")
+    return [app_commands.Choice(name=f"Search: {current}", value=current)]
+
+
+@bot.hybrid_command(name="p", description="Play a song from YouTube/Spotify", aliases=["play"])
 @app_commands.describe(query="Song name, YouTube/Spotify URL, or search query")
+@app_commands.autocomplete(query=song_autocomplete)  # Attach autocomplete here
 async def play(ctx: commands.Context, *, query: str):
     """Play a song from YouTube/Spotify (searches YouTube if not a URL)"""
     if not ctx.voice_client:
@@ -478,42 +530,7 @@ async def play(ctx: commands.Context, *, query: str):
             await ctx.send(f"❌ Error: {str(e)}")
 
 
-async def song_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-    if len(current) < 3:  # Avoid too broad/short queries
-        return []
 
-    async with aiohttp.ClientSession() as session:
-        try:
-            url = "https://clients1.google.com/complete/search"
-            params = {
-                'client': 'youtube',
-                'hl': 'en',      # Change to your preferred language if needed
-                'gl': 'us',      # Change to your country code if needed
-                'ds': 'yt',      # YouTube suggestions
-                'q': current
-            }
-            async with session.get(url, params=params, timeout=2.0) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    # Parse the weird prefixed JSON response
-                    start = text.find('[')
-                    if start != -1:
-                        json_text = text[start:]
-                        import json
-                        data = json.loads(json_text)
-                        suggestions = data[1][:10]  # First 10 suggestions
-                        choices = []
-                        for sugg in suggestions:
-                            title = sugg[0][:100]  # Truncate long titles
-                            choices.append(app_commands.Choice(name=title, value=title))
-                        return choices
-        except Exception as e:
-            print(f"Autocomplete error: {repr(e)}")
-    return []
-
-@play.autocomplete("query")  # 'query' is the parameter name in your hybrid_command
-async def play_query_autocomplete(interaction: discord.Interaction, current: str):
-    return await song_autocomplete(interaction, current)
 
 @bot.command(name='pause')
 async def pause(ctx):
